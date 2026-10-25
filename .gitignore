@@ -1,2 +1,4 @@
 .pytest_cache
 .venv
+git add .gitignore
+git commit -m "Stop tracking command.txt"command.txt
