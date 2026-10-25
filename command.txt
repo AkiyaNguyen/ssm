@@ -1,0 +1,37 @@
+# ===== Mamba from scratch: commands =====
+# Run every command from this folder:
+cd /d/selfStudy/Lab_TheoreticalML/Code/mamba_from_scratch
+
+# ---------- 1. Setup (one time; .venv is already created, skip to "activate") ----------
+# NOTE: in Git Bash, `python` points to MSYS2 (C:/msys64/mingw64), which has no
+# PyTorch wheels. Use the Windows launcher `py` to create the venv instead.
+py -m venv .venv
+source .venv/Scripts/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+
+# Every new terminal: activate first
+#   Git Bash:   source .venv/Scripts/activate
+#   PowerShell: .\.venv\Scripts\Activate.ps1
+# Check: should print a path inside .venv
+python -c "import sys; print(sys.executable)"
+
+# Optional: GPU build of PyTorch (pick the CUDA version matching your driver)
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+
+# ---------- 2. Tests ----------
+# All tests
+python -m pytest -v
+
+# Implement in this order and run each group as you go
+python -m pytest -v tests/test_ssm.py -k discretize
+python -m pytest -v tests/test_ssm.py
+python -m pytest -v tests/test_mamba_block.py -k init
+python -m pytest -v tests/test_mamba_block.py -k selective_params
+python -m pytest -v tests/test_mamba_block.py
+
+# Stop at first failure, show full traceback
+python -m pytest -x --tb=long
+
+# ---------- 3. Demo ----------
+python demo.py
