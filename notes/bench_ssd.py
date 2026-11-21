@@ -4,19 +4,21 @@ Supports device-adaptive presets (``cpu`` vs ``cuda``) via ``--device``:
     python notes/bench_ssd.py --device auto
     python notes/bench_ssd.py --device cpu
     python notes/bench_ssd.py --device cuda
+    python notes/bench_ssd.py --device all
 
-Saves plots under ``notes/images/``:
-  1. ``ssd_exp1_cl_sweep_<device>.png``: Sweep ``(c, l)`` at fixed ``L``.
-  2. ``ssd_exp2_p_sweep_<device>.png``: Sweep ``(P, h)`` at fixed ``d_inner = h * P``.
+Saves plots + JSON results under ``notes/images/`` and bundles them into
+``notes/images/ssd_bench_outputs.zip``.
 """
 
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import json
 from pathlib import Path
 import sys
 import time
+import zipfile
 
 import matplotlib.pyplot as plt
 import torch
@@ -38,7 +40,7 @@ OUT_DIR = REPO_ROOT / "notes" / "images"
 @dataclass(frozen=True)
 class BenchConfig:
     device: str
-    dtype: torch.dtype
+    dtype_name: str
     warmup: int
     iters: int
     # Exp 1: sweep (c, l) at fixed L
@@ -56,11 +58,15 @@ class BenchConfig:
     exp2_n: int
     exp2_ps: tuple[int, ...]
 
+    @property
+    def dtype(self) -> torch.dtype:
+        return getattr(torch, self.dtype_name)
+
 
 CONFIGS: dict[str, BenchConfig] = {
     "cpu": BenchConfig(
         device="cpu",
-        dtype=torch.float32,
+        dtype_name="float32",
         warmup=1,
         iters=2,
         exp1_b=1,
@@ -78,19 +84,19 @@ CONFIGS: dict[str, BenchConfig] = {
     ),
     "cuda": BenchConfig(
         device="cuda",
-        dtype=torch.float16,
+        dtype_name="float16",
         warmup=3,
         iters=10,
-        exp1_b=2,
-        exp1_L=4096,
-        exp1_h=8,
+        exp1_b=4,
+        exp1_L=8192,
+        exp1_h=16,
         exp1_p=64,
         exp1_n=64,
-        exp1_ls=(8, 16, 32, 64, 128, 256, 512, 1024),
-        exp2_b=1,
-        exp2_L=1024,
-        exp2_d_inner=512,
-        exp2_l=64,
+        exp1_ls=(16, 32, 64, 128, 256, 512, 1024),
+        exp2_b=2,
+        exp2_L=4096,
+        exp2_d_inner=1024,
+        exp2_l=256,
         exp2_n=64,
         exp2_ps=(1, 4, 16, 32, 64, 128, 256),
     ),
@@ -187,7 +193,7 @@ def measure_unfused_exact(
     return flops, io_bytes, ai, ms
 
 
-def run_exp1(cfg: BenchConfig) -> None:
+def run_exp1(cfg: BenchConfig) -> list[dict]:
     X = torch.randn(cfg.exp1_b, cfg.exp1_L, cfg.exp1_h, cfg.exp1_p, device=cfg.device, dtype=cfg.dtype)
     A = -torch.rand(cfg.exp1_b, cfg.exp1_L, cfg.exp1_h, device=cfg.device, dtype=cfg.dtype) * 0.2
     B = torch.randn(cfg.exp1_b, cfg.exp1_L, cfg.exp1_h, cfg.exp1_n, device=cfg.device, dtype=cfg.dtype)
@@ -195,7 +201,7 @@ def run_exp1(cfg: BenchConfig) -> None:
 
     ls = list(cfg.exp1_ls)
     cs = [cfg.exp1_L // l for l in ls]
-    mss, mbs = [], []
+    mss, mbs, records = [], [], []
 
     print(
         f"=== Experiment 1 [{cfg.device.upper()}]: Sweep (c, l) at fixed "
@@ -209,6 +215,7 @@ def run_exp1(cfg: BenchConfig) -> None:
         )
         mss.append(ms)
         mbs.append(mb)
+        records.append({"l": l, "c": c, "ms": round(ms, 4), "peak_mb": round(mb, 4)})
         print(f"{l:>6} {c:>6} | {ms:>8.2f} {mb:>10.2f}")
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), dpi=150)
@@ -242,12 +249,14 @@ def run_exp1(cfg: BenchConfig) -> None:
     fig.savefig(out_path)
     plt.close(fig)
     print(f"Saved {out_path}\n")
+    return records
 
 
-def run_exp2(cfg: BenchConfig) -> None:
+def run_exp2(cfg: BenchConfig) -> list[dict]:
     ps = list(cfg.exp2_ps)
     impls = [("sequential", ssd_sequential), ("quadratic", ssd_quadratic), ("chunked", ssd_chunked)]
-    results = {name: {"ai": [], "ms": [], "io_mb": [], "flops_m": []} for name, _ in impls}
+    results = {name: {"ai": [], "ms": []} for name, _ in impls}
+    records: list[dict] = []
 
     print(
         f"=== Experiment 2 [{cfg.device.upper()}]: Sweep (P, h) at fixed "
@@ -264,14 +273,29 @@ def run_exp2(cfg: BenchConfig) -> None:
         C = torch.randn(cfg.exp2_b, cfg.exp2_L, h, cfg.exp2_n, device=cfg.device, dtype=cfg.dtype)
 
         for name, fn in impls:
-            flops, io_bytes, ai, ms = measure_unfused_exact(
-                fn, X, A, B, C, cfg.exp2_l, cfg.device, cfg.warmup, cfg.iters
-            )
-            results[name]["ai"].append(ai)
-            results[name]["ms"].append(ms)
-            results[name]["io_mb"].append(io_bytes / 1e6)
-            results[name]["flops_m"].append(flops / 1e6)
-            print(f"{name:>10} {P:>4} {h:>4} | {flops/1e6:>10.2f} {io_bytes/1e6:>10.2f} {ai:>8.2f} {ms:>8.2f}")
+            try:
+                flops, io_bytes, ai, ms = measure_unfused_exact(
+                    fn, X, A, B, C, cfg.exp2_l, cfg.device, cfg.warmup, cfg.iters
+                )
+                results[name]["ai"].append(ai)
+                results[name]["ms"].append(ms)
+                records.append({
+                    "impl": name,
+                    "P": P,
+                    "h": h,
+                    "flops_m": round(flops / 1e6, 4),
+                    "io_mb": round(io_bytes / 1e6, 4),
+                    "ai": round(ai, 4),
+                    "ms": round(ms, 4),
+                    "oom": False,
+                })
+                print(f"{name:>10} {P:>4} {h:>4} | {flops/1e6:>10.2f} {io_bytes/1e6:>10.2f} {ai:>8.2f} {ms:>8.2f}")
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                results[name]["ai"].append(float("nan"))
+                results[name]["ms"].append(float("nan"))
+                records.append({"impl": name, "P": P, "h": h, "oom": True})
+                print(f"{name:>10} {P:>4} {h:>4} | {'OOM':>10} {'OOM':>10} {'OOM':>8} {'OOM':>8}")
 
     fig, axes = plt.subplots(1, 2, figsize=(12.5, 4.5), dpi=150)
     x_idx = list(range(len(ps)))
@@ -304,31 +328,67 @@ def run_exp2(cfg: BenchConfig) -> None:
     out_path = OUT_DIR / f"ssd_exp2_p_sweep_{cfg.device}.png"
     fig.savefig(out_path)
     plt.close(fig)
-    print(f"Saved {out_path}")
+    print(f"Saved {out_path}\n")
+    return records
+
+
+def run_for_device(device: str) -> None:
+    cfg = CONFIGS[device]
+    exp1_records = run_exp1(cfg)
+    exp2_records = run_exp2(cfg)
+
+    hw_name = torch.cuda.get_device_name(0) if device == "cuda" else "CPU"
+    payload = {
+        "device": device,
+        "hardware": hw_name,
+        "config": asdict(cfg),
+        "exp1": exp1_records,
+        "exp2": exp2_records,
+    }
+    json_path = OUT_DIR / f"ssd_bench_{device}.json"
+    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"Saved {json_path}\n")
+
+
+def package_outputs() -> Path:
+    zip_path = OUT_DIR / "ssd_bench_outputs.zip"
+    files = sorted(list(OUT_DIR.glob("ssd_*.png")) + list(OUT_DIR.glob("ssd_*.json")))
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for f in files:
+            zf.write(f, arcname=f.name)
+    print(f"Packaged {len(files)} files into {zip_path}")
+    return zip_path
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Benchmark Mamba-2 SSD implementations.")
     parser.add_argument(
         "--device",
-        choices=("auto", "cpu", "cuda"),
+        choices=("auto", "cpu", "cuda", "all"),
         default="auto",
-        help="Device preset to run ('auto' picks cuda if available else cpu).",
+        help="Device preset to run ('auto' picks cuda if available else cpu; 'all' runs both).",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    device = ("cuda" if torch.cuda.is_available() else "cpu") if args.device == "auto" else args.device
-    if device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("--device cuda requested, but CUDA is not available.")
+    if args.device == "auto":
+        devices = ["cuda" if torch.cuda.is_available() else "cpu"]
+    elif args.device == "all":
+        devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+        if not torch.cuda.is_available():
+            print("Warning: CUDA not available; running CPU preset only.")
+    else:
+        if args.device == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("--device cuda requested, but CUDA is not available.")
+        devices = [args.device]
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(0)
-    cfg = CONFIGS[device]
-    run_exp1(cfg)
-    run_exp2(cfg)
+    for dev in devices:
+        run_for_device(dev)
+    package_outputs()
 
 
 if __name__ == "__main__":
